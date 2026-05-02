@@ -100,11 +100,12 @@ def _capture_chapter(
 
     pdf_path = Path(temp_dir) / f"chapter_{chapter_num}.pdf"
     page.emulate_media(media="screen")
+    scroll_height = page.evaluate("document.documentElement.scrollHeight")
     page.pdf(
         path=str(pdf_path),
         print_background=True,
         width="800px",
-        height="1200px",
+        height=f"{scroll_height}px",
         margin={"top": "0", "right": "0", "bottom": "0", "left": "0"},
     )
 
