@@ -1,0 +1,11 @@
+__pycache__/
+*.pyc
+*.egg-info/
+dist/
+build/
+venv/
+.venv/
+.playwright_state.json
+temp_pdfs/
+*.pdf
+.DS_Store
