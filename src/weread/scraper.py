@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -7,7 +8,7 @@ from typing import Callable, Optional
 
 from playwright.sync_api import sync_playwright, Page
 
-from weread.auth import load_cookies, save_cookies, ensure_login
+from weread.auth import get_storage_state_path, ensure_login
 from weread.errors import ChapterLoadError
 
 _CHAPTER_CONTENT = ".readerChapterContent"
@@ -15,6 +16,14 @@ _FOOTER_BTN = ".readerFooter_button:visible"
 _CHAPTER_TITLE = ".readerTopBar_title_link,.readerTopBar_title"
 _RENDER_TIMEOUT = 15000
 _MAX_RETRY = 1
+
+_BROWSER_ARGS = [
+    "--disable-blink-features=AutomationControlled",
+]
+_USER_AGENT = (
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36"
+)
 
 
 @dataclass
@@ -106,21 +115,32 @@ def scrape(
     url: str,
     on_progress: Optional[Callable[[int, str], None]] = None,
 ) -> ScrapeResult:
+    logging.getLogger("pdfminer").setLevel(logging.ERROR)
+
     temp_dir = tempfile.mkdtemp(prefix="weread_")
     result = ScrapeResult(book_name="", temp_dir=temp_dir)
 
     with sync_playwright() as p:
-        browser = p.chromium.launch(headless=False)
-        context = browser.new_context(
-            viewport={"width": 800, "height": 1200}
+        browser = p.chromium.launch(
+            headless=False,
+            channel="chrome",
+            args=_BROWSER_ARGS,
         )
-        load_cookies(context)
+
+        state_path = get_storage_state_path()
+        context_kwargs: dict = {
+            "viewport": {"width": 800, "height": 1200},
+            "user_agent": _USER_AGENT,
+        }
+        if state_path:
+            context_kwargs["storage_state"] = str(state_path)
+
+        context = browser.new_context(**context_kwargs)
         page = context.new_page()
 
-        print(f"🔍 正在打开微信读书...")
-        page.goto(url, wait_until="domcontentloaded")
+        print("🔍 正在打开微信读书...")
+        page.goto(url, wait_until="domcontentloaded", timeout=30000)
         ensure_login(page)
-        save_cookies(context)
 
         result.book_name = _get_book_name(page)
         print(f"📖 开始抓取《{result.book_name}》")
