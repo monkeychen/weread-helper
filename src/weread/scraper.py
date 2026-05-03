@@ -335,6 +335,17 @@ def _capture_chapter(
 ) -> ChapterInfo:
     chapter_name = _get_chapter_name(page)
 
+    # The top bar element may contain both book name and chapter title on separate lines.
+    # Extract just the chapter title (the line that's not the book name).
+    if chapter_name and '\n' in chapter_name:
+        book_fp = _text_fingerprint(book_name)
+        non_book = [
+            l.strip() for l in chapter_name.split('\n')
+            if l.strip() and _text_fingerprint(l.strip()) != book_fp
+        ]
+        if non_book:
+            chapter_name = non_book[0]
+
     # Record log positions BEFORE render so initial viewport draws are captured
     text_start = page.evaluate("window.__wr_text_log__.length")
     img_start = page.evaluate("window.__wr_img_log__.length")
