@@ -8,7 +8,6 @@ venv/
 .playwright_state.json
 temp_pdfs/
 *.pdf
-*.md
 output/
 .DS_Store
 .pytest_cache/
