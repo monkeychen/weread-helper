@@ -1,12 +1,14 @@
 from __future__ import annotations
 
+import hashlib
 import logging
 import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, Optional
+from urllib.parse import urlparse
 
-from playwright.sync_api import sync_playwright, Page
+from playwright.sync_api import sync_playwright, Page, BrowserContext
 
 from weread.auth import get_storage_state_path, ensure_login
 from weread.errors import ChapterLoadError
@@ -25,21 +27,228 @@ _USER_AGENT = (
     "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36"
 )
 
+# Injected before page scripts run — intercepts fillText (text) and drawImage (images)
+_CANVAS_INTERCEPT = """
+window.__wr_text_log__ = [];
+window.__wr_img_log__ = [];
 
-@dataclass
-class ChapterInfo:
-    num: int
-    name: str
-    pdf_path: Path
-    text: str = ""
+const _origFill = CanvasRenderingContext2D.prototype.fillText;
+CanvasRenderingContext2D.prototype.fillText = function(text, x, y) {
+    if (text && text.trim().length > 0) {
+        window.__wr_text_log__.push([String(text), Math.round(x), Math.round(y)]);
+    }
+    return _origFill.apply(this, arguments);
+};
+
+const _origDraw = CanvasRenderingContext2D.prototype.drawImage;
+CanvasRenderingContext2D.prototype.drawImage = function() {
+    const src = arguments[0];
+    let imgUrl = null;
+    if (src instanceof HTMLImageElement) {
+        imgUrl = src.currentSrc || src.src || null;
+    }
+    if (imgUrl && !imgUrl.startsWith('data:')) {
+        const nArgs = arguments.length;
+        const dy = nArgs >= 9 ? arguments[6] : (nArgs >= 3 ? arguments[2] : 0);
+        window.__wr_img_log__.push([imgUrl, Math.round(dy || 0)]);
+    }
+    return _origDraw.apply(this, arguments);
+};
+"""
+
+# Font-test line WeRead draws on every page load (used to measure glyph widths)
+_FONT_TEST_PREFIX = "abcdefghijklmnopqrstuvwxyz"
 
 
-@dataclass
-class ScrapeResult:
-    book_name: str
-    chapters: list[ChapterInfo] = field(default_factory=list)
-    skipped: list[str] = field(default_factory=list)
-    temp_dir: str = ""
+def _download_image(context: BrowserContext, src: str, images_dir: Path) -> Optional[str]:
+    """Download an image using the browser's authenticated session; return filename or None."""
+    try:
+        response = context.request.get(src, timeout=10000)
+        if not response.ok:
+            return None
+        parsed = urlparse(src)
+        fname = Path(parsed.path).name
+        if not fname or "." not in fname:
+            fname = hashlib.md5(src.encode()).hexdigest()[:16] + ".jpg"
+        local_path = images_dir / fname
+        local_path.write_bytes(response.body())
+        return fname
+    except Exception:
+        return None
+
+
+def _collect_chapter_content(
+    page: Page,
+    text_start: int = 0,
+    img_start: int = 0,
+    images_dir: Optional[Path] = None,
+) -> str:
+    """Scroll to trigger all canvas renders, extract text + images, return markdown string."""
+    page.evaluate("""async () => {
+        const h = document.documentElement.scrollHeight;
+        const step = 400;
+        for (let y = 0; y < h; y += step) {
+            window.scrollTo(0, y);
+            await new Promise(r => setTimeout(r, 80));
+        }
+        window.scrollTo(0, 0);
+    }""")
+    page.wait_for_timeout(1000)
+
+    # --- Text: filter font-test block, group by Y (±4px), sort by X ---
+    all_text = page.evaluate("window.__wr_text_log__") or []
+    raw_text = all_text[text_start:]
+
+    entries = []
+    skip = True
+    for text, x, y in raw_text:
+        if skip:
+            if text == "a" or text.startswith(_FONT_TEST_PREFIX):
+                continue
+            skip = False
+        entries.append((text, x, y))
+
+    text_lines: list[tuple[str, int]] = []  # (line_text, line_y)
+    if entries:
+        entries.sort(key=lambda e: (e[2], e[1]))
+        cur_line: list[tuple[str, int]] = []
+        cur_y = entries[0][2]
+        for text, x, y in entries:
+            if abs(y - cur_y) > 4:
+                if cur_line:
+                    cur_line.sort(key=lambda e: e[1])
+                    joined = "".join(t for t, _ in cur_line)
+                    if not joined.startswith(_FONT_TEST_PREFIX):
+                        text_lines.append((joined, cur_y))
+                cur_line = [(text, x)]
+                cur_y = y
+            else:
+                cur_line.append((text, x))
+        if cur_line:
+            cur_line.sort(key=lambda e: e[1])
+            joined = "".join(t for t, _ in cur_line)
+            if not joined.startswith(_FONT_TEST_PREFIX):
+                text_lines.append((joined, cur_y))
+
+    # --- Canvas top offset: convert canvas-local Y to document Y ---
+    canvas_top: int = page.evaluate("""() => {
+        const canvases = Array.from(document.querySelectorAll('canvas'));
+        if (!canvases.length) return 0;
+        const best = canvases.reduce((a, b) =>
+            (a.width * a.height > b.width * b.height) ? a : b);
+        return Math.round(best.getBoundingClientRect().top + window.scrollY);
+    }""")
+
+    # --- Images: DOM query (primary) + canvas drawImage log (fallback) ---
+    img_refs: list[tuple[str, int]] = []  # (md_ref, doc_y)
+    if images_dir:
+        seen_urls: set = set()
+        img_candidates: list[tuple[str, int]] = []  # (url, doc_y)
+
+        # Primary: DOM <img> elements inside the reader (reliable for WeRead)
+        dom_imgs = page.evaluate("""() => {
+            function isInContentFlow(el) {
+                // Skip images inside fixed/sticky containers (top bar, sidebars)
+                let node = el;
+                while (node && node !== document.body) {
+                    const pos = window.getComputedStyle(node).position;
+                    if (pos === 'fixed' || pos === 'sticky') return false;
+                    node = node.parentElement;
+                }
+                return true;
+            }
+            function isUIAsset(src) {
+                // Webpack-hashed static assets (e.g. loading_dark.41a70b39.png)
+                if (/\\.[0-9a-f]{8}\\.[a-z]+$/.test(src)) return true;
+                // Explicit loading / spinner patterns
+                if (/loading|spinner|placeholder/i.test(src)) return true;
+                return false;
+            }
+            // Prefer scoped query; fall back to all imgs if container not found
+            let imgs = document.querySelectorAll(
+                '.readerChapterContent img, .reader_main img, .readerContent img');
+            if (!imgs.length) {
+                imgs = document.querySelectorAll('img[src]');
+            }
+            return Array.from(imgs)
+                .filter(img =>
+                    img.naturalWidth > 80 &&
+                    img.naturalHeight > 80 &&
+                    img.src && !img.src.startsWith('data:') &&
+                    !isUIAsset(img.src) &&
+                    isInContentFlow(img))
+                .map(img => ({
+                    url: img.src,
+                    y: Math.round(img.getBoundingClientRect().top + window.scrollY)
+                }));
+        }""") or []
+        for item in dom_imgs:
+            url = item["url"]
+            if url not in seen_urls:
+                seen_urls.add(url)
+                img_candidates.append((url, item["y"]))
+
+        # Fallback: canvas drawImage intercept (catches canvas-rendered images)
+        all_imgs = page.evaluate("window.__wr_img_log__") or []
+        raw_imgs = all_imgs[img_start:]
+        seen_canvas: set = set()
+        for url, canvas_y in raw_imgs:
+            key = (url, canvas_y // 50)
+            if key in seen_canvas:
+                continue
+            seen_canvas.add(key)
+            if url not in seen_urls:
+                seen_urls.add(url)
+                img_candidates.append((url, canvas_top + canvas_y))
+
+        for url, doc_y in img_candidates:
+            fname = _download_image(page.context, url, images_dir)
+            if fname:
+                img_refs.append((f"![](images/{fname})", doc_y))
+
+    # Convert text line Y to document space for merging with images
+    text_lines_doc = [(text, canvas_top + y) for text, y in text_lines]
+
+    if not text_lines_doc and not img_refs:
+        return ""
+
+    # --- Paragraph detection from Y gaps (same relative differences after offset) ---
+    line_ys = sorted(set(y for _, y in text_lines_doc))
+    if len(line_ys) >= 3:
+        gaps = sorted(b - a for a, b in zip(line_ys, line_ys[1:]) if b > a)
+        median_gap = gaps[len(gaps) // 2]
+        para_threshold = max(median_gap * 2.2, median_gap + 10)
+    else:
+        para_threshold = 40
+
+    # Merge text and images by document Y
+    all_items: list[tuple[int, str, bool]] = (
+        [(y, text, False) for text, y in text_lines_doc]
+        + [(y, ref, True) for ref, y in img_refs]
+    )
+    all_items.sort(key=lambda x: x[0])
+
+    result: list[str] = []
+    prev_text_y: Optional[int] = None
+    for y, content, is_img in all_items:
+        if is_img:
+            if result and result[-1] != "":
+                result.append("")
+            result.append(content)
+            result.append("")
+            prev_text_y = None
+        else:
+            if prev_text_y is not None and (y - prev_text_y) > para_threshold:
+                if result and result[-1] != "":
+                    result.append("")
+            result.append(content)
+            prev_text_y = y
+
+    # Strip trailing blank lines
+    while result and result[-1] == "":
+        result.pop()
+
+    return "\n".join(result)
 
 
 def _wait_for_render(page: Page) -> None:
@@ -84,9 +293,13 @@ def _has_next_chapter(page: Page) -> bool:
 
 
 def _capture_chapter(
-    page: Page, chapter_num: int, temp_dir: str
+    page: Page, chapter_num: int, temp_dir: str, images_dir: Path, book_name: str = ""
 ) -> ChapterInfo:
     chapter_name = _get_chapter_name(page)
+
+    # Record log positions BEFORE render so initial viewport draws are captured
+    text_start = page.evaluate("window.__wr_text_log__.length")
+    img_start = page.evaluate("window.__wr_img_log__.length")
 
     for attempt in range(_MAX_RETRY + 1):
         try:
@@ -98,10 +311,29 @@ def _capture_chapter(
                     chapter_num, chapter_name, "渲染超时，重试后仍失败"
                 )
             page.reload()
+            text_start = 0  # init script reinitialises logs on full reload
+            img_start = 0
 
-    # Extract text directly from DOM before PDF capture
-    content_el = page.query_selector(_CHAPTER_CONTENT)
-    text = content_el.inner_text().strip() if content_el else ""
+    text = _collect_chapter_content(
+        page,
+        text_start=text_start,
+        img_start=img_start,
+        images_dir=images_dir,
+    )
+
+    # WeRead top bar shows the book title, not the chapter title.
+    # When that happens, pull the real title from the first text line of content.
+    if (not chapter_name or chapter_name == book_name) and text:
+        for i, line in enumerate(text.split("\n")):
+            stripped = line.strip()
+            if stripped and not stripped.startswith("!["):
+                chapter_name = stripped
+                # Remove that line (and any leading blank lines) from body
+                body_lines = text.split("\n")[i + 1:]
+                while body_lines and body_lines[0].strip() == "":
+                    body_lines.pop(0)
+                text = "\n".join(body_lines)
+                break
 
     pdf_path = Path(temp_dir) / f"chapter_{chapter_num}.pdf"
     page.emulate_media(media="screen")
@@ -117,6 +349,22 @@ def _capture_chapter(
     return ChapterInfo(num=chapter_num, name=chapter_name, pdf_path=pdf_path, text=text)
 
 
+@dataclass
+class ChapterInfo:
+    num: int
+    name: str
+    pdf_path: Path
+    text: str = ""
+
+
+@dataclass
+class ScrapeResult:
+    book_name: str
+    chapters: list[ChapterInfo] = field(default_factory=list)
+    skipped: list[str] = field(default_factory=list)
+    temp_dir: str = ""
+
+
 def scrape(
     url: str,
     on_progress: Optional[Callable[[int, str], None]] = None,
@@ -124,6 +372,8 @@ def scrape(
     logging.getLogger("pdfminer").setLevel(logging.ERROR)
 
     temp_dir = tempfile.mkdtemp(prefix="weread_")
+    images_dir = Path(temp_dir) / "images"
+    images_dir.mkdir()
     result = ScrapeResult(book_name="", temp_dir=temp_dir)
 
     with sync_playwright() as p:
@@ -142,6 +392,7 @@ def scrape(
             context_kwargs["storage_state"] = str(state_path)
 
         context = browser.new_context(**context_kwargs)
+        context.add_init_script(_CANVAS_INTERCEPT)
         page = context.new_page()
 
         print("🔍 正在打开微信读书...")
@@ -154,7 +405,7 @@ def scrape(
         chapter_num = 1
         while True:
             try:
-                info = _capture_chapter(page, chapter_num, temp_dir)
+                info = _capture_chapter(page, chapter_num, temp_dir, images_dir, result.book_name)
                 result.chapters.append(info)
                 display_name = info.name or f"第{chapter_num}章"
                 if on_progress:
