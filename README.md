@@ -52,14 +52,14 @@ playwright install chromium
 pytest
 ```
 
-## ⚠️ 免责声明
+## ⚠️ Disclaimer
 
-> **本项目仅供个人学习研究与技术交流使用，请勿用于任何商业或非法用途。**
+> **This project is intended solely for personal learning, research, and technical exchange. Do not use it for any commercial or illegal purposes.**
 
-- 本项目不提供任何书籍资源，所有内容均来自用户已购买的微信读书账户。
-- 使用本工具导出的内容仅供个人阅读备份，严禁用于传播、分发或商业牟利。
-- 用户应遵守微信读书的[服务协议](https://weread.qq.com/web/copyright)及相关法律法规，因违规使用造成的一切后果由用户自行承担，与本项目开发者无关。
-- 如本项目侵犯了您的权益，请通过 [Issues](https://github.com/monkeychen/weread-helper/issues) 联系我们，我们将及时处理。
+- This project does not provide any book resources. All content comes from the user's own purchased WeRead account.
+- Exported content is for personal reading backup only. Redistribution, sharing, or commercial use is strictly prohibited.
+- Users must comply with WeRead's [Terms of Service](https://weread.qq.com/web/copyright) and all applicable laws and regulations. The developer assumes no responsibility for any consequences arising from misuse.
+- If this project infringes on your rights, please contact us via [Issues](https://github.com/monkeychen/weread-helper/issues) and we will address it promptly.
 
 ## License
 
