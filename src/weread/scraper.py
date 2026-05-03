@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import logging
+import re
 import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -35,7 +36,8 @@ window.__wr_img_log__ = [];
 const _origFill = CanvasRenderingContext2D.prototype.fillText;
 CanvasRenderingContext2D.prototype.fillText = function(text, x, y) {
     if (text && text.trim().length > 0) {
-        window.__wr_text_log__.push([String(text), Math.round(x), Math.round(y)]);
+        const width = Math.round(this.measureText(text).width);
+        window.__wr_text_log__.push([String(text), Math.round(x), Math.round(y), width]);
     }
     return _origFill.apply(this, arguments);
 };
@@ -60,6 +62,11 @@ CanvasRenderingContext2D.prototype.drawImage = function() {
 _FONT_TEST_PREFIX = "abcdefghijklmnopqrstuvwxyz"
 
 
+def _text_fingerprint(s: str) -> str:
+    """Normalize text for fuzzy comparison — strip whitespace, punctuation, case."""
+    return re.sub(r'[^\w]', '', s, flags=re.UNICODE).lower()
+
+
 def _download_image(context: BrowserContext, src: str, images_dir: Path) -> Optional[str]:
     """Download an image using the browser's authenticated session; return filename or None."""
     try:
@@ -75,6 +82,23 @@ def _download_image(context: BrowserContext, src: str, images_dir: Path) -> Opti
         return fname
     except Exception:
         return None
+
+
+def _join_line_fragments(frags: list[tuple[str, int, int, int]]) -> str:
+    """Join canvas fillText fragments on the same Y line, inserting spaces at X gaps."""
+    if not frags:
+        return ""
+    if len(frags) == 1:
+        return frags[0][0]
+    parts = [frags[0][0]]
+    prev_end = frags[0][1] + frags[0][3]  # x + w
+    for text, x, _y, w in frags[1:]:
+        gap = x - prev_end
+        if gap > 2:
+            parts.append(" ")
+        parts.append(text)
+        prev_end = x + w
+    return "".join(parts)
 
 
 def _collect_chapter_content(
@@ -101,34 +125,38 @@ def _collect_chapter_content(
 
     entries = []
     skip = True
-    for text, x, y in raw_text:
+    for item in raw_text:
+        if len(item) >= 4:
+            text, x, y, w = item[0], item[1], item[2], item[3]
+        else:
+            text, x, y, w = item[0], item[1], item[2], 0
         if skip:
             if text == "a" or text.startswith(_FONT_TEST_PREFIX):
                 continue
             skip = False
-        entries.append((text, x, y))
+        entries.append((text, x, y, w))
 
-    text_lines: list[tuple[str, int]] = []  # (line_text, line_y)
+    text_lines: list[tuple[str, int, int]] = []  # (line_text, line_y, start_x)
     if entries:
         entries.sort(key=lambda e: (e[2], e[1]))
-        cur_line: list[tuple[str, int]] = []
+        cur_line: list[tuple[str, int, int, int]] = []  # (text, x, y, w)
         cur_y = entries[0][2]
-        for text, x, y in entries:
+        for text, x, y, w in entries:
             if abs(y - cur_y) > 4:
                 if cur_line:
                     cur_line.sort(key=lambda e: e[1])
-                    joined = "".join(t for t, _ in cur_line)
+                    joined = _join_line_fragments(cur_line)
                     if not joined.startswith(_FONT_TEST_PREFIX):
-                        text_lines.append((joined, cur_y))
-                cur_line = [(text, x)]
+                        text_lines.append((joined, cur_y, cur_line[0][1]))
+                cur_line = [(text, x, y, w)]
                 cur_y = y
             else:
-                cur_line.append((text, x))
+                cur_line.append((text, x, y, w))
         if cur_line:
             cur_line.sort(key=lambda e: e[1])
-            joined = "".join(t for t, _ in cur_line)
+            joined = _join_line_fragments(cur_line)
             if not joined.startswith(_FONT_TEST_PREFIX):
-                text_lines.append((joined, cur_y))
+                text_lines.append((joined, cur_y, cur_line[0][1]))
 
     # --- Canvas top offset: convert canvas-local Y to document Y ---
     canvas_top: int = page.evaluate("""() => {
@@ -207,30 +235,34 @@ def _collect_chapter_content(
                 img_refs.append((f"![](images/{fname})", doc_y))
 
     # Convert text line Y to document space for merging with images
-    text_lines_doc = [(text, canvas_top + y) for text, y in text_lines]
+    text_lines_doc = [(text, canvas_top + y, sx) for text, y, sx in text_lines]
 
     if not text_lines_doc and not img_refs:
         return ""
 
-    # --- Paragraph detection from Y gaps (same relative differences after offset) ---
-    line_ys = sorted(set(y for _, y in text_lines_doc))
+    # --- Paragraph detection: X-indent (primary) + Y-gap (fallback) ---
+    start_xs = [sx for _, _, sx in text_lines_doc]
+    base_x = min(start_xs) if start_xs else 0
+    indent_threshold = 15
+
+    line_ys = sorted(set(y for _, y, _ in text_lines_doc))
     if len(line_ys) >= 3:
         gaps = sorted(b - a for a, b in zip(line_ys, line_ys[1:]) if b > a)
         median_gap = gaps[len(gaps) // 2]
-        para_threshold = max(median_gap * 2.2, median_gap + 10)
+        y_para_threshold = median_gap * 3
     else:
-        para_threshold = 40
+        y_para_threshold = 100
 
     # Merge text and images by document Y
-    all_items: list[tuple[int, str, bool]] = (
-        [(y, text, False) for text, y in text_lines_doc]
-        + [(y, ref, True) for ref, y in img_refs]
+    all_items: list[tuple[int, str, bool, int]] = (
+        [(y, text, False, sx) for text, y, sx in text_lines_doc]
+        + [(y, ref, True, 0) for ref, y in img_refs]
     )
     all_items.sort(key=lambda x: x[0])
 
     result: list[str] = []
     prev_text_y: Optional[int] = None
-    for y, content, is_img in all_items:
+    for y, content, is_img, start_x in all_items:
         if is_img:
             if result and result[-1] != "":
                 result.append("")
@@ -238,9 +270,15 @@ def _collect_chapter_content(
             result.append("")
             prev_text_y = None
         else:
-            if prev_text_y is not None and (y - prev_text_y) > para_threshold:
-                if result and result[-1] != "":
-                    result.append("")
+            is_paragraph_start = False
+            # Primary: indent detection
+            if start_x > base_x + indent_threshold:
+                is_paragraph_start = True
+            # Fallback: large Y gap
+            if prev_text_y is not None and (y - prev_text_y) > y_para_threshold:
+                is_paragraph_start = True
+            if is_paragraph_start and result and result[-1] != "":
+                result.append("")
             result.append(content)
             prev_text_y = y
 
@@ -322,18 +360,36 @@ def _capture_chapter(
     )
 
     # WeRead top bar shows the book title, not the chapter title.
-    # When that happens, pull the real title from the first text line of content.
-    if (not chapter_name or chapter_name == book_name) and text:
-        for i, line in enumerate(text.split("\n")):
+    # Always try to extract the real chapter title from text content.
+    book_fp = _text_fingerprint(book_name)
+    if text and (not chapter_name or _text_fingerprint(chapter_name) == book_fp):
+        lines = text.split("\n")
+        consumed = 0
+        for i, line in enumerate(lines):
             stripped = line.strip()
-            if stripped and not stripped.startswith("!["):
-                chapter_name = stripped
-                # Remove that line (and any leading blank lines) from body
-                body_lines = text.split("\n")[i + 1:]
-                while body_lines and body_lines[0].strip() == "":
+            if not stripped or stripped.startswith("!["):
+                continue
+            if _text_fingerprint(stripped) == book_fp:
+                continue
+            chapter_name = stripped
+            consumed = i + 1
+            break
+
+        if consumed:
+            body_lines = lines[consumed:]
+            # Remove duplicate chapter title (e.g. Chinese+English combined line)
+            while body_lines:
+                first = body_lines[0].strip()
+                if not first:
                     body_lines.pop(0)
-                text = "\n".join(body_lines)
-                break
+                    continue
+                if first.startswith(chapter_name) and first != chapter_name:
+                    body_lines.pop(0)
+                    while body_lines and not body_lines[0].strip():
+                        body_lines.pop(0)
+                else:
+                    break
+            text = "\n".join(body_lines)
 
     pdf_path = Path(temp_dir) / f"chapter_{chapter_num}.pdf"
     page.emulate_media(media="screen")
