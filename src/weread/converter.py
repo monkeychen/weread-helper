@@ -2,7 +2,6 @@ from __future__ import annotations
 
 from pathlib import Path
 
-import pdfplumber
 import PyPDF2
 from ebooklib import epub
 
@@ -22,27 +21,14 @@ def merge_pdfs(result: ScrapeResult, output_path: Path) -> None:
         raise ConvertError("pdf", str(e)) from e
 
 
-def _extract_text(pdf_path: Path) -> str:
-    text_parts = []
-    with pdfplumber.open(str(pdf_path)) as pdf:
-        for page in pdf.pages:
-            t = page.extract_text()
-            if t:
-                text_parts.append(t)
-    return "\n\n".join(text_parts)
-
-
 def convert_to_markdown(result: ScrapeResult, output_path: Path) -> None:
     try:
         lines = [f"# {result.book_name}\n"]
         for ch in result.chapters:
-            lines.append(f"# {ch.name}\n")
-            text = _extract_text(ch.pdf_path)
-            lines.append(text if text else "(此章无可提取文本)")
+            lines.append(f"## {ch.name}\n")
+            lines.append(ch.text if ch.text else "(此章无内容)")
             lines.append("")
         output_path.write_text("\n".join(lines), encoding="utf-8")
-    except ConvertError:
-        raise
     except Exception as e:
         raise ConvertError("markdown", str(e)) from e
 
@@ -56,15 +42,16 @@ def convert_to_epub(result: ScrapeResult, output_path: Path) -> None:
 
         chapters_epub = []
         for ch in result.chapters:
-            text = _extract_text(ch.pdf_path)
-            content = text.replace("\n", "<br/>") if text else "<p>此章无可提取文本</p>"
+            paragraphs = "".join(
+                f"<p>{line}</p>" for line in ch.text.splitlines() if line.strip()
+            ) if ch.text else "<p>此章无内容</p>"
 
             c = epub.EpubHtml(
                 title=ch.name,
                 file_name=f"chapter_{ch.num}.xhtml",
                 lang="zh",
             )
-            c.content = f"<h1>{ch.name}</h1><p>{content}</p>"
+            c.content = f"<h1>{ch.name}</h1>{paragraphs}"
             book.add_item(c)
             chapters_epub.append(c)
 
@@ -92,13 +79,13 @@ def convert(
         out_path = output_dir / f"{safe_name}.{fmt}"
         try:
             if fmt == "pdf":
-                print(f"📦 生成 PDF...")
+                print("📦 生成 PDF...")
                 merge_pdfs(result, out_path)
             elif fmt == "epub":
-                print(f"📦 生成 EPUB...")
+                print("📦 生成 EPUB...")
                 convert_to_epub(result, out_path)
             elif fmt == "md":
-                print(f"📦 生成 Markdown...")
+                print("📦 生成 Markdown...")
                 convert_to_markdown(result, out_path)
             else:
                 print(f"⚠ 未知格式: {fmt}，跳过")

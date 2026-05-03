@@ -31,6 +31,7 @@ class ChapterInfo:
     num: int
     name: str
     pdf_path: Path
+    text: str = ""
 
 
 @dataclass
@@ -98,6 +99,10 @@ def _capture_chapter(
                 )
             page.reload()
 
+    # Extract text directly from DOM before PDF capture
+    content_el = page.query_selector(_CHAPTER_CONTENT)
+    text = content_el.inner_text().strip() if content_el else ""
+
     pdf_path = Path(temp_dir) / f"chapter_{chapter_num}.pdf"
     page.emulate_media(media="screen")
     scroll_height = page.evaluate("document.documentElement.scrollHeight")
@@ -109,7 +114,7 @@ def _capture_chapter(
         margin={"top": "0", "right": "0", "bottom": "0", "left": "0"},
     )
 
-    return ChapterInfo(num=chapter_num, name=chapter_name, pdf_path=pdf_path)
+    return ChapterInfo(num=chapter_num, name=chapter_name, pdf_path=pdf_path, text=text)
 
 
 def scrape(

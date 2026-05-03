@@ -21,7 +21,7 @@ def _make_result(tmp_path: Path, count: int = 3) -> ScrapeResult:
     for i in range(1, count + 1):
         pdf = tmp_path / f"chapter_{i}.pdf"
         _make_dummy_pdf(pdf)
-        chapters.append(ChapterInfo(num=i, name=f"第{i}章", pdf_path=pdf))
+        chapters.append(ChapterInfo(num=i, name=f"第{i}章", pdf_path=pdf, text=f"第{i}章的正文内容。\n这是第二段。"))
     return ScrapeResult(
         book_name="测试书名", chapters=chapters, temp_dir=str(tmp_path)
     )
@@ -52,8 +52,9 @@ class TestConvertToMarkdown:
         convert_to_markdown(result, out)
         assert out.exists()
         content = out.read_text(encoding="utf-8")
-        assert "# 第1章" in content
-        assert "# 第2章" in content
+        assert "## 第1章" in content
+        assert "## 第2章" in content
+        assert "第1章的正文内容" in content
 
 
 class TestConvertToEpub:
