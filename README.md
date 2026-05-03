@@ -1,4 +1,4 @@
-# weread-scrapy
+# weread-helper
 
 Export books from [WeRead (微信读书)](https://weread.qq.com) as PDF, EPUB, or Markdown.
 
